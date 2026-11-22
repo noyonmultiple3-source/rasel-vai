@@ -1,0 +1,18 @@
+# nixpacks.toml — build/start for Railway and Render (Nixpacks builder)
+# Railway auto-detects this. On Render, select Nixpacks as the builder.
+#
+# Install runs in [phases.install] (before /app/node_modules/.cache is mounted),
+# with --include=dev so TypeScript (tsc) and @types/* are installed even when
+# NODE_ENV=production is set. [phases.build] only compiles TypeScript → dist/.
+
+[phases.install]
+cmds = ["npm ci --include=dev"]
+
+[phases.build]
+cmds = ["npm run build"]
+
+[start]
+cmd = "npm start"
+
+[variables]
+NODE_ENV = "production"
