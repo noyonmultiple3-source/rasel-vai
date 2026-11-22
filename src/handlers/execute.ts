@@ -5,7 +5,6 @@ import { isUserLocked, runFullExecution, ALREADY_COMPLETED_MESSAGE } from '../ex
 import { checkWalletReferralEligibility, OTHER_REFERRER_INELIGIBLE_MESSAGE } from '../bsc.js';
 import {
   safeUpdateUser,
-  getUser,
   hasCompletedCycleForAgent,
   getLatestUnfinishedMint,
 } from '../db.js';
@@ -99,12 +98,15 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
   runFullExecution(userId, onStatus)
     .then(async (result) => {
       if (result.ok) {
-        await safeUpdateUser(userId, { current_step: 'completed' });
-        await notifyAdmin(ctx, userId, result.agentId, result);
-        // Replace live status with final clean report
-        await ctx.telegram.editMessageText(chatId, messageId, undefined, result.summary, {
-          reply_markup: KB.postExecution.reply_markup,
-        });
+        // Send user summary immediately in parallel with admin notification;
+        // `current_step = 'completed'` and `completedCount` are already updated atomically by logExecution.
+        const userDisplayName = ctx.from?.first_name ?? ctx.from?.username ?? String(userId);
+        await Promise.all([
+          ctx.telegram.editMessageText(chatId, messageId, undefined, result.summary, {
+            reply_markup: KB.postExecution.reply_markup,
+          }),
+          notifyAdmin(ctx, userId, userDisplayName, result.agentId, result),
+        ]);
       } else if (result.ineligibleOtherReferrer) {
         await safeUpdateUser(userId, { current_step: 'failed' });
         await ctx.telegram.editMessageText(chatId, messageId, undefined, OTHER_REFERRER_INELIGIBLE_MESSAGE, {
@@ -142,34 +144,25 @@ export async function handleCompleteProcess(ctx: Context): Promise<void> {
 async function notifyAdmin(
   ctx: Context,
   userId: number,
+  userDisplayName: string,
   agentId: string,
-  result: { mintCostBnb: string; sellBnb: string; pnlOrFee: string; mintTxHash: string },
+  result: { mintCostBnb: string; sellBnb: string; pnlOrFee: string; mintTxHash: string; completedCount: number },
 ): Promise<void> {
-  let user = null;
-  try {
-    user = await getUser(userId);
-  } catch (err) {
-    logger.warn({ err, userId }, 'notifyAdmin: failed to load user record');
-  }
-
-  const name = user?.first_name ?? user?.username ?? String(userId);
-  // Note: executor.logExecution already incremented completed_count before returning ok=true.
-  const totalCompleted = user?.completed_count ?? 1;
   const text =
     `✅ Job Completed\n\n` +
-    `User: ${name} (ID: ${userId})\n` +
+    `User: ${userDisplayName} (ID: ${userId})\n` +
     `Agent ID: ${agentId}\n` +
     `Mint cost: ${result.mintCostBnb} BNB\n` +
     `Sell: ${result.sellBnb} BNB\n` +
     `PnL: ${result.pnlOrFee} BNB\n` +
     `Mint TX: ${result.mintTxHash}\n` +
-    `Total completed by user: ${totalCompleted}`;
+    `Total completed by user: ${result.completedCount}`;
 
-  for (const adminId of config.ADMIN_IDS) {
-    try {
-      await ctx.telegram.sendMessage(adminId, text);
-    } catch (err) {
-      logger.warn({ err, adminId }, 'Failed to notify admin');
-    }
-  }
+  await Promise.all(
+    config.ADMIN_IDS.map((adminId) =>
+      ctx.telegram.sendMessage(adminId, text).catch((err) => {
+        logger.warn({ err, adminId }, 'Failed to notify admin');
+      }),
+    ),
+  );
 }

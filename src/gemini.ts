@@ -155,58 +155,53 @@ export interface ExecutionSummaryInput {
 }
 
 /**
- * Generates a clean, human-readable execution summary using Gemini.
+ * Formats a clean, lightweight plain-text execution summary instantaneously
+ * from already-available run data (no external LLM network round-trip latency).
  */
 export async function generateExecutionSummary(
   data: ExecutionSummaryInput,
 ): Promise<string> {
-  try {
-    const prompt = `Create a concise, friendly Telegram message summarizing this BSC mint/sell execution result.
-Use emojis. Format numbers clearly. Include all transaction hashes as short references.
-
-Data:
-- Agent ID: ${data.agentId}
-- Status: ${data.status}
-- Mint cost: ${data.mintCostBnb} BNB
-- AI tokens received: ${data.tokensReceived}
-- BNB from sale: ${data.sellBnb} BNB
-- P&L / fees: ${data.pnlOrFee} BNB
-- Mint TX: ${data.mintTxHash}
-- Approve TX: ${data.approveTxHash}
-- Sell TX: ${data.sellTxHash}
-${data.stopReason ? `- Stop reason: ${data.stopReason}` : ''}
-
-Keep it under 250 words. Use clean plain text only (no Markdown, asterisks, backticks, or HTML tags).`;
-
-    const response = await ai.interactions.create({
-      model: 'gemini-3.8-flash',
-      input: prompt,
-      store: false,
-    });
-
-    return response.output_text?.trim() || buildFallbackSummary(data);
-  } catch (err) {
-    if (isGeminiRateLimitError(err)) {
-      logger.warn({ err }, 'Gemini free-tier rate limit / quota reached in generateExecutionSummary — using deterministic fallback');
-    } else {
-      logger.error({ err }, 'generateExecutionSummary failed — using deterministic fallback');
-    }
-    return buildFallbackSummary(data);
-  }
+  return formatFastExecutionSummary(data);
 }
 
-function buildFallbackSummary(data: ExecutionSummaryInput): string {
+function shortHash(hash: string): string {
+  if (!hash || !hash.startsWith('0x') || hash.length <= 18) return hash || '-';
+  return `${hash.slice(0, 10)}…${hash.slice(-8)}`;
+}
+
+function formatNumber(raw: string, decimals = 6): string {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return raw;
+  return n.toLocaleString('en-US', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: decimals,
+  });
+}
+
+export function formatFastExecutionSummary(data: ExecutionSummaryInput): string {
+  const pnlNum  = Number(data.pnlOrFee);
+  const pnlSign = Number.isFinite(pnlNum) && pnlNum > 0 ? '+' : '';
+  const header  =
+    data.status === 'COMPLETED'
+      ? '✅ Execution Completed!'
+      : data.status === 'STOPPED'
+        ? '⚠️ Execution Stopped'
+        : '❌ Execution Failed';
+
   const lines = [
-    `Execution ${data.status}`,
+    header,
+    ``,
     `🤖 Agent ID: ${data.agentId}`,
     `💰 Mint Cost: ${data.mintCostBnb} BNB`,
-    `🪙 AI Tokens: ${data.tokensReceived}`,
+    `🪙 AI Tokens: ${formatNumber(data.tokensReceived, 4)} AI`,
     `💵 Sale Proceeds: ${data.sellBnb} BNB`,
-    `📊 P&L: ${data.pnlOrFee} BNB`,
-    `📋 Mint TX: ${data.mintTxHash}`,
-    `✅ Approve TX: ${data.approveTxHash}`,
-    `💱 Sell TX: ${data.sellTxHash}`,
+    `📊 Net P&L: ${pnlSign}${data.pnlOrFee} BNB`,
+    ``,
+    `🔗 Transactions (BSC):`,
+    `• Mint: ${shortHash(data.mintTxHash)}`,
+    `• Approve: ${shortHash(data.approveTxHash)}`,
+    `• Sell: ${shortHash(data.sellTxHash)}`,
   ];
-  if (data.stopReason) lines.push(`⚠️ Stopped: ${data.stopReason}`);
+  if (data.stopReason) lines.push(``, `⚠️ Note: ${data.stopReason}`);
   return lines.join('\n');
 }

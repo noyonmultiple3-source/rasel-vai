@@ -111,11 +111,16 @@ const ROUTER_ABI = [
   'function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory)',
 ];
 
+const WBNB_ABI = [
+  'event Withdrawal(address indexed src, uint256 wad)',
+];
+
 // ─── Read-only contract interfaces ───────────────────────────────────────────
 
 const mintIface   = new ethers.Interface(MINT_ABI);
 const erc20Iface  = new ethers.Interface(ERC20_ABI);
 const routerIface = new ethers.Interface(ROUTER_ABI);
+const wbnbIface   = new ethers.Interface(WBNB_ABI);
 
 function mintContract()    { return new ethers.Contract(ADDR.MINT_CONTRACT,  MINT_ABI,   provider); }
 function aiTokenContract() { return new ethers.Contract(ADDR.AI_TOKEN,       ERC20_ABI,  provider); }
@@ -182,7 +187,7 @@ export async function readTxValueWei(txHash: string): Promise<bigint | null> {
 }
 
 export type ReceiptPollResult =
-  | { state: 'confirmed'; receipt: ethers.TransactionReceipt; mintedTokensFromLogs: bigint }
+  | { state: 'confirmed'; receipt: ethers.TransactionReceipt; mintedTokensFromLogs: bigint; wbnbOutFromLogs: bigint }
   | { state: 'reverted'; receipt: ethers.TransactionReceipt }
   | { state: 'cancelled' }
   | { state: 'timeout' };
@@ -190,7 +195,7 @@ export type ReceiptPollResult =
 /**
  * Polls BSC (`chainId: 56`) for a transaction receipt at short intervals while
  * respecting user cancellation on every tick. Distinguishes `status === 1`
- * (confirmed, also parsing AI token Transfer logs to `walletAddress`) from
+ * (confirmed, also parsing AI token Transfer logs and WBNB Withdrawal logs) from
  * `status === 0` (reverted on-chain).
  */
 export async function pollTransactionReceipt(
@@ -208,6 +213,7 @@ export async function pollTransactionReceipt(
     ? normalizeAddress(opts.walletAddress, 'pollReceipt.walletAddress').toLowerCase()
     : null;
   const aiTokenLower   = ADDR.AI_TOKEN.toLowerCase();
+  const wbnbLower      = ADDR.WBNB.toLowerCase();
   const deadline       = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
@@ -218,9 +224,10 @@ export async function pollTransactionReceipt(
       if (receipt) {
         if (receipt.status === 1) {
           let mintedTokensFromLogs = 0n;
-          if (targetWallet) {
-            for (const log of receipt.logs) {
-              if (log.address.toLowerCase() !== aiTokenLower) continue;
+          let wbnbOutFromLogs = 0n;
+          for (const log of receipt.logs) {
+            const addrLower = log.address.toLowerCase();
+            if (targetWallet && addrLower === aiTokenLower) {
               try {
                 const parsed = erc20Iface.parseLog({ topics: [...log.topics], data: log.data });
                 if (parsed?.name === 'Transfer') {
@@ -232,6 +239,15 @@ export async function pollTransactionReceipt(
               } catch {
                 // non-Transfer log — ignore
               }
+            } else if (addrLower === wbnbLower) {
+              try {
+                const parsed = wbnbIface.parseLog({ topics: [...log.topics], data: log.data });
+                if (parsed?.name === 'Withdrawal') {
+                  wbnbOutFromLogs += BigInt(parsed.args[1]);
+                }
+              } catch {
+                // non-Withdrawal log — ignore
+              }
             }
           }
           logger.info(
@@ -241,10 +257,11 @@ export async function pollTransactionReceipt(
               blockNumber: receipt.blockNumber,
               gasUsed: receipt.gasUsed.toString(),
               mintedTokensFromLogs: mintedTokensFromLogs.toString(),
+              wbnbOutFromLogs: wbnbOutFromLogs.toString(),
             },
             'BSC transaction receipt confirmed',
           );
-          return { state: 'confirmed', receipt, mintedTokensFromLogs };
+          return { state: 'confirmed', receipt, mintedTokensFromLogs, wbnbOutFromLogs };
         }
 
         logger.warn(

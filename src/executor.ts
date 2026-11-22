@@ -141,6 +141,7 @@ export interface ExecutionSuccess {
   mintTxHash: string;
   approveTxHash: string;
   sellTxHash: string;
+  completedCount: number;
 }
 
 export interface ExecutionFailure {
@@ -793,6 +794,7 @@ export async function runFullExecution(
     // until confirmed — stopping only on user cancel, session expiration, or 0 AI balance.
     const bnbBefore = await readBnbBalance(walletAddress);
     let sellTxHash = '';
+    let sellWbnbFromLogs = 0n;
     let sellAttempt = 0;
     let lastSellEditAt = 0;
     let soldTokensWei = tokensReceived;
@@ -930,6 +932,9 @@ export async function runFullExecution(
           sellTxHash = '';
           throw new Error(`Sell TX ${revertedSell.slice(0, 12)}… reverted on-chain (status=0)`);
         }
+        if (sellReceipt.state === 'confirmed') {
+          sellWbnbFromLogs = sellReceipt.wbnbOutFromLogs;
+        }
         break;
       } catch (err) {
         const e = err as Error & { isSessionExpired?: boolean };
@@ -957,40 +962,47 @@ export async function runFullExecution(
       }
     }
 
-    // ── 8. Compute actual BNB received ────────────────────────────────────────
-    const bnbAfter   = await readBnbBalance(walletAddress);
-    const bnbReceived = bnbAfter > bnbBefore ? bnbAfter - bnbBefore : 0n;
-    const bnbReceivedF = parseFloat(ethers.formatEther(bnbReceived));
-    const pnl          = bnbReceivedF - mintCostF;
+    // ── 8. Compute actual BNB received (reuse WBNB Withdrawal log from sell receipt; 0 extra RPC when present) ──
+    let bnbReceived = sellWbnbFromLogs;
+    if (bnbReceived === 0n) {
+      const bnbAfter = await readBnbBalance(walletAddress);
+      bnbReceived = bnbAfter > bnbBefore ? bnbAfter - bnbBefore : 0n;
+    }
+    const bnbReceivedF    = parseFloat(ethers.formatEther(bnbReceived));
+    const pnl             = bnbReceivedF - mintCostF;
+    const mintCostStr     = mintCostF.toFixed(6);
+    const tokensStr       = ethers.formatUnits(tokensReceived, 18);
+    const sellBnbStr      = bnbReceivedF.toFixed(6);
+    const pnlStr          = pnl.toFixed(6);
 
-    // ── 9. Persist to DB ──────────────────────────────────────────────────────
-    await logExecution(userId, walletAddress, 'COMPLETED', actualMintCost, tokensReceived, bnbReceived, txHashes, agentId);
-
-    // ── 10. Gemini summary (single call, free-tier-safe) ─────────────────────
-    await onStatus('✍️ Generating summary…');
-    const summary = await generateExecutionSummary({
-      agentId,
-      mintCostBnb:    mintCostF.toFixed(6),
-      tokensReceived: ethers.formatUnits(tokensReceived, 18),
-      sellBnb:        bnbReceivedF.toFixed(6),
-      pnlOrFee:       pnl.toFixed(6),
-      mintTxHash:     mintTxHash,
-      approveTxHash:  approveTxHash,
-      sellTxHash:     sellTxHash,
-      status:         'COMPLETED',
-    });
+    // ── 9 & 10. Build instant summary + persist to DB in parallel (zero sequential waterfall) ──
+    const [completedCount, summary] = await Promise.all([
+      logExecution(userId, walletAddress, 'COMPLETED', actualMintCost, tokensReceived, bnbReceived, txHashes, agentId),
+      generateExecutionSummary({
+        agentId,
+        mintCostBnb:    mintCostStr,
+        tokensReceived: tokensStr,
+        sellBnb:        sellBnbStr,
+        pnlOrFee:       pnlStr,
+        mintTxHash:     mintTxHash,
+        approveTxHash:  approveTxHash,
+        sellTxHash:     sellTxHash,
+        status:         'COMPLETED',
+      }),
+    ]);
 
     return {
       ok: true,
       summary,
       agentId,
-      mintCostBnb:    mintCostF.toFixed(6),
-      tokensReceived: ethers.formatUnits(tokensReceived, 18),
-      sellBnb:        bnbReceivedF.toFixed(6),
-      pnlOrFee:       pnl.toFixed(6),
+      mintCostBnb:    mintCostStr,
+      tokensReceived: tokensStr,
+      sellBnb:        sellBnbStr,
+      pnlOrFee:       pnlStr,
       mintTxHash,
       approveTxHash,
       sellTxHash,
+      completedCount,
     };
 
   } catch (err: unknown) {
@@ -1025,7 +1037,7 @@ async function logExecution(
   txHashes: Partial<Record<string, string>>,
   agentId: string,
   stopReason?: string,
-): Promise<void> {
+): Promise<number> {
   try {
     const mintCostBnb = parseFloat(ethers.formatEther(mintCostWei));
     const tokensF     = parseFloat(ethers.formatUnits(tokensWei, 18));
@@ -1037,7 +1049,7 @@ async function logExecution(
       : walletAddress?.trim() ? walletAddress.trim()
       : null;
 
-    await insertExecution({
+    const insertPromise = insertExecution({
       telegram_user_id: userId,
       wallet_address:   walletAddress?.trim() || null,
       agent_id_name:    agentIdName,
@@ -1053,12 +1065,25 @@ async function logExecution(
 
     if (status === 'COMPLETED') {
       recordCompletedAgentInMemory({ agentIdName, walletAddress });
-      await pool.query(
-        'UPDATE users SET completed_count = completed_count + 1, last_active_at = now() WHERE telegram_user_id = $1',
-        [userId],
-      );
+      const [, userRes] = await Promise.all([
+        insertPromise,
+        pool.query<{ completed_count: number }>(
+          `UPDATE users
+           SET completed_count = completed_count + 1,
+               current_step    = 'completed',
+               last_active_at  = now()
+           WHERE telegram_user_id = $1
+           RETURNING completed_count`,
+          [userId],
+        ),
+      ]);
+      return userRes.rows[0]?.completed_count ?? 1;
     }
+
+    await insertPromise;
+    return 0;
   } catch (dbErr) {
     logger.error({ dbErr }, 'logExecution: DB write failed');
+    return status === 'COMPLETED' ? 1 : 0;
   }
 }
